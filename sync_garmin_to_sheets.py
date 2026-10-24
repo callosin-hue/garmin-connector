@@ -26,7 +26,8 @@ SHEET_ID = os.environ["SHEET_ID"]
 DAYS_BACK = int(os.environ.get("DAYS_BACK", "3"))
 HEADER_ROW = 5          # fila de cabeceras en cada pestaña "Sem N"
 FIRST_DAY_ROW = 6       # fila del lunes
-COLS = {"Sueño (h)": "sueno", "FC media": "fc", "Peso (kg)": "peso"}
+COLS = {"Sueño (h)": "sueno", "FC media": "fc", "Peso (kg)": "peso",
+        "RPE (1-10)": "rpe"}
 
 
 def garmin_client() -> Garmin:
@@ -37,6 +38,28 @@ def garmin_client() -> Garmin:
     api = Garmin()
     api.login(tmp)
     return api
+
+
+def activity_rpe(api: Garmin, act: dict):
+    """RPE (1-10) de una actividad, o None si no lo registraste en el reloj.
+
+    Garmin lo guarda en escala 0-100 en pasos de 10 (50 = RPE 5). Si el campo
+    no viene en el listado, se consulta el detalle de la actividad.
+    """
+    raw = act.get("directWorkoutRpe")
+    if raw is None:
+        try:
+            det = api.get_activity(act["activityId"]) or {}
+            raw = (det.get("summaryDTO") or {}).get("directWorkoutRpe")
+            if raw is None:
+                raw = det.get("directWorkoutRpe")
+        except Exception as e:
+            print(f"  RPE detalle {act.get('activityId')}: {e}")
+    print(f"  actividad {act.get('activityId')} "
+          f"({(act.get('activityType') or {}).get('typeKey')}): RPE bruto={raw}")
+    if not raw:
+        return None
+    return max(1, min(10, round(raw / 10)))
 
 
 def day_metrics(api: Garmin, d: date) -> dict:
@@ -51,15 +74,22 @@ def day_metrics(api: Garmin, d: date) -> dict:
     except Exception as e:
         print(f"  [{ds}] sueño: {e}")
 
-    try:  # FC media del día = media de las actividades ponderada por duración
+    try:  # actividades del día: FC media y RPE
         acts = api.get_activities_by_date(ds, ds) or []
+
+        # FC media del día = media ponderada por duración
         pairs = [(a["averageHR"], a.get("duration") or 0)
                  for a in acts if a.get("averageHR")]
         total = sum(w for _, w in pairs)
         if total:
             out["fc"] = round(sum(h * w for h, w in pairs) / total)
+
+        # RPE: si hay varias actividades, se queda con la más dura del día
+        rpes = [r for r in (activity_rpe(api, a) for a in acts) if r]
+        if rpes:
+            out["rpe"] = max(rpes)
     except Exception as e:
-        print(f"  [{ds}] FC: {e}")
+        print(f"  [{ds}] actividades: {e}")
 
     try:  # peso (Garmin lo devuelve en gramos)
         comp = api.get_body_composition(ds) or {}
