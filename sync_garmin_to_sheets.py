@@ -1,7 +1,8 @@
 """Sincroniza datos de Garmin Connect con la hoja Plan_Epic_2027.
 
-Rellena, en las pestañas "Sem N", las columnas "Sueño (h)", "FC media" y
-"Peso (kg)" de los últimos DAYS_BACK días. RPE, dolor de Aquiles, notas y
+Rellena, en las pestañas "Sem N", de los últimos DAYS_BACK días:
+"Sueño (h)", "RPE (1-10)", "FC media", "Peso (kg)", "Datos Garmin (series...)",
+"Tiempo total" y "Ritmo medio / distancia". Dolor de Aquiles, notas y
 "¿Hecho?" no se tocan (son manuales).
 
 Variables de entorno:
@@ -27,7 +28,11 @@ DAYS_BACK = int(os.environ.get("DAYS_BACK", "3"))
 HEADER_ROW = 5          # fila de cabeceras en cada pestaña "Sem N"
 FIRST_DAY_ROW = 6       # fila del lunes
 COLS = {"Sueño (h)": "sueno", "FC media": "fc", "Peso (kg)": "peso",
-        "RPE (1-10)": "rpe"}
+        "RPE (1-10)": "rpe",
+        "Datos Garmin (series: tiempo y ritmo de cada una)": "series",
+        "Tiempo total": "tiempo",
+        "Ritmo medio / distancia": "ritmo"}
+MAX_SERIES = 40         # máximo de series que se escriben por actividad
 
 
 def garmin_client() -> Garmin:
@@ -62,6 +67,103 @@ def activity_rpe(api: Garmin, act: dict):
     return max(1, min(10, round(raw / 10)))
 
 
+def num(x: float, decimals: int) -> str:
+    """Número con coma decimal, como en tu hoja (13,2)."""
+    return f"{x:.{decimals}f}".replace(".", ",")
+
+
+def fmt_dur(sec: float, force_hours: bool = False) -> str:
+    sec = int(round(sec))
+    h, rest = divmod(sec, 3600)
+    m, s = divmod(rest, 60)
+    return f"{h}:{m:02d}:{s:02d}" if (h or force_hours) else f"{m}:{s:02d}"
+
+
+def sport_kind(act: dict) -> str:
+    t = ((act.get("activityType") or {}).get("typeKey") or "").lower()
+    if "swim" in t:
+        return "swim"
+    if any(k in t for k in ("cycl", "bik", "ride")):
+        return "bike"
+    if any(k in t for k in ("run", "walk", "hik")):
+        return "run"
+    return "other"
+
+
+SPORT_LABEL = {"swim": "Natación", "bike": "Bici", "run": "Carrera"}
+
+
+def fmt_pace(kind: str, speed) -> str | None:
+    """Ritmo según el deporte: min/100 m nadando, km/h en bici, min/km a pie."""
+    if not speed or speed <= 0:
+        return None
+    if kind == "swim":
+        return f"{fmt_dur(100 / speed)}/100 m"
+    if kind == "bike":
+        return f"{num(speed * 3.6, 1)} km/h"
+    return f"{fmt_dur(1000 / speed)}/km"
+
+
+def fmt_dist(kind: str, meters) -> str | None:
+    if not meters or meters <= 0:
+        return None
+    if kind == "swim":
+        return f"{int(round(meters))} m"
+    return f"{num(meters / 1000, 2)} km"
+
+
+def activity_series(api: Garmin, act: dict, kind: str) -> list:
+    """Una línea por serie/vuelta: '1) 5:02 · 1:41/100 m · 300 m'."""
+    try:
+        data = api.get_activity_splits(act["activityId"]) or {}
+    except Exception as e:
+        print(f"  series {act.get('activityId')}: {e}")
+        return []
+    lines = []
+    for lap in data.get("lapDTOs") or []:
+        dur, dist = lap.get("duration") or 0, lap.get("distance") or 0
+        if dur <= 0 or dist <= 0:     # descansos sin distancia
+            continue
+        speed = lap.get("averageSpeed") or dist / dur
+        parts = [fmt_dur(dur), fmt_pace(kind, speed)]
+        show_dist = kind == "swim" or (kind == "run" and abs(dist - 1000) > 50)
+        if show_dist:
+            parts.append(fmt_dist(kind, dist))
+        lines.append(f"{len(lines) + 1}) " + " · ".join(p for p in parts if p))
+    if len(lines) > MAX_SERIES:
+        extra = len(lines) - MAX_SERIES
+        lines = lines[:MAX_SERIES] + [f"... (+{extra} series más)"]
+    return lines
+
+
+def activity_texts(api: Garmin, acts: list) -> dict:
+    """Series, tiempo total y ritmo medio/distancia del día."""
+    acts = sorted((a for a in acts if (a.get("duration") or 0) > 0),
+                  key=lambda a: a.get("startTimeLocal") or "")
+    if not acts:
+        return {}
+    out = {"tiempo": fmt_dur(sum(a["duration"] for a in acts), force_hours=True)}
+    multi = len(acts) > 1
+
+    resumen, series = [], []
+    for a in acts:
+        kind = sport_kind(a)
+        label = SPORT_LABEL.get(kind) or (a.get("activityType") or {}).get("typeKey")
+        pace = fmt_pace(kind, a.get("averageSpeed"))
+        dist = fmt_dist(kind, a.get("distance"))
+        txt = " · ".join(p for p in (pace, dist) if p)
+        if txt:
+            resumen.append(f"{label}: {txt}" if multi else txt)
+        lines = activity_series(api, a, kind)
+        if lines:
+            series.append("\n".join(([f"[{label}]"] if multi else []) + lines))
+    if resumen:
+        out["ritmo"] = " | ".join(resumen)
+    if series:
+        out["series"] = "\n".join(series)
+    return out
+
+
 def day_metrics(api: Garmin, d: date) -> dict:
     ds = d.isoformat()
     out = {}
@@ -88,6 +190,9 @@ def day_metrics(api: Garmin, d: date) -> dict:
         rpes = [r for r in (activity_rpe(api, a) for a in acts) if r]
         if rpes:
             out["rpe"] = max(rpes)
+
+        # series, tiempo total y ritmo medio / distancia
+        out.update(activity_texts(api, acts))
     except Exception as e:
         print(f"  [{ds}] actividades: {e}")
 
