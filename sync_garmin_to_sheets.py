@@ -126,6 +126,10 @@ def activity_series(api: Garmin, act: dict, kind: str) -> list:
             continue
         speed = lap.get("averageSpeed") or dist / dur
         parts = [fmt_dur(dur), fmt_pace(kind, speed)]
+        if kind == "bike":
+            watts = lap.get("averagePower")
+            if watts:
+                parts.append(f"{int(round(watts))} W")
         show_dist = kind == "swim" or (kind == "run" and abs(dist - 1000) > 50)
         if show_dist:
             parts.append(fmt_dist(kind, dist))
